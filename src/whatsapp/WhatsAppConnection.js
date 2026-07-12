@@ -35,6 +35,7 @@ class WhatsAppConnection {
     this.sock = null;
     this.status = ConnectionStatus.DISCONNECTED;
     this.starting = false;
+    this.waitForPendingWrites = null;
   }
 
   setStatus(status) {
@@ -55,10 +56,23 @@ class WhatsAppConnection {
     this.starting = true;
 
     try {
+      // Si el socket anterior todavía tiene una escritura de creds en
+      // curso (p. ej. el `creds.update` que llega justo antes de un
+      // `close` tras validar el pairing code), hay que esperar a que
+      // termine de persistirse en disco ANTES de volver a leer el auth
+      // state. De lo contrario `useMultiFileAuthState` puede leer un
+      // creds.json todavía viejo (con `registered: false`) y este start()
+      // pediría un pairing code nuevo sobre un intento que WhatsApp ya
+      // había aceptado, rompiendo el flujo de vinculación.
+      if (this.waitForPendingWrites) {
+        await this.waitForPendingWrites().catch(() => {});
+      }
+
       const authDir = getAuthDir(this.deviceId);
       fs.mkdirSync(authDir, { recursive: true });
 
-      const { state, saveCreds } = await createAuthState(authDir);
+      const { state, saveCreds, waitForPendingWrites } = await createAuthState(authDir);
+      this.waitForPendingWrites = waitForPendingWrites;
 
       const sock = makeWASocket({
         auth: state,
@@ -161,6 +175,7 @@ class WhatsAppConnection {
     } catch (e) {
       log('warn', `[${this.deviceId}] No se pudo limpiar auth state: ${e.message}`);
     }
+    this.waitForPendingWrites = null;
   }
 
   /** Desvinculación explícita solicitada por el usuario (no automática). */

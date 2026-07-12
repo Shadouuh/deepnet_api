@@ -20,7 +20,16 @@ async function createAuthState(authDir) {
     return queue;
   };
 
-  return { state, saveCreds: persistCreds };
+  // Expuesto para que quien reconecte (nuevo socket) pueda esperar a que
+  // toda escritura de creds en curso de ESTE socket termine de flushear a
+  // disco antes de volver a leer el auth state. Sin esto, un `close` que
+  // llega justo después de un `creds.update` (p. ej. tras validar el
+  // pairing code) puede disparar un `start()` que lea creds.json todavía
+  // desactualizado — con `registered` en false — y vuelva a pedir otro
+  // pairing code sobre un intento que en realidad ya había sido aceptado.
+  const waitForPendingWrites = () => queue;
+
+  return { state, saveCreds: persistCreds, waitForPendingWrites };
 }
 
 module.exports = { createAuthState };
