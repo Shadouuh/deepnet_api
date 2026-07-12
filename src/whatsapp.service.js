@@ -192,6 +192,9 @@ async function connect(phoneNumber, deviceId = 'default', options = {}) {
         const isLoggedOut = statusCode === DisconnectReason.loggedOut;
         const isRestartRequired = statusCode === DisconnectReason.restartRequired;
         const isConnectionClosed = statusCode === DisconnectReason.connectionClosed;
+        // Fuente de verdad: credenciales realmente registradas en disco/memoria,
+        // no el status interno (que puede desincronizarse por condiciones de carrera).
+        const isRegistered = !!sock?.authState?.creds?.registered;
 
         log('warn', `Conexión cerrada (código: ${statusCode}, estado previo: ${prevStatus})`);
 
@@ -225,8 +228,31 @@ async function connect(phoneNumber, deviceId = 'default', options = {}) {
           return;
         }
 
-        // ── WAITING_PAIRING sin restartRequired → fallo real ──
+        // ── WAITING_PAIRING sin restartRequired ──
         if (prevStatus === ConnectionStatus.WAITING_PAIRING) {
+          // Si las credenciales ya están registradas, el pairing SÍ se completó
+          // (creds.update ya corrió). Este cierre es solo el reinicio normal que
+          // WhatsApp exige tras aceptar el código — NUNCA hay que tratarlo como
+          // expiración ni limpiar el auth state recién guardado.
+          if (isRegistered) {
+            if (pairingTimeouts.has(deviceId)) {
+              clearTimeout(pairingTimeouts.get(deviceId));
+              pairingTimeouts.delete(deviceId);
+            }
+            log('ok', 'Pairing ya confirmado (creds registradas) — reconectando con sesión existente, sin limpiar auth state');
+            statuses.set(deviceId, ConnectionStatus.CONNECTED);
+            emitEvent(deviceId, 'status', ConnectionStatus.CONNECTED);
+            setTimeout(() => {
+              connect(phoneNumber, deviceId, { skipAuthCleanup: true }).catch(err => {
+                log('error', `Error en reconexión: ${err.message}`);
+                statuses.set(deviceId, ConnectionStatus.ERROR);
+                emitEvent(deviceId, 'status', ConnectionStatus.ERROR);
+                emitEvent(deviceId, 'error', err);
+              });
+            }, 1000);
+            return;
+          }
+
           const sep = chalk.dim('─'.repeat(50));
           console.log(`\n${sep}`);
           log('warn', `${chalk.bold('Vinculación fallida')} — conexión cerrada durante el pareo`);
@@ -276,7 +302,10 @@ async function connect(phoneNumber, deviceId = 'default', options = {}) {
         statuses.set(deviceId, ConnectionStatus.CONNECTING);
         emitEvent(deviceId, 'status', ConnectionStatus.CONNECTING);
         setTimeout(() => {
-          connect(phoneNumber, deviceId).catch(err => {
+          // Nunca limpiar el auth state en una reconexión automática si el
+          // dispositivo ya está registrado — solo un loggedOut real (manejado
+          // arriba) o una nueva vinculación explícita deben disparar limpieza.
+          connect(phoneNumber, deviceId, { skipAuthCleanup: isRegistered }).catch(err => {
             log('error', `Error en reconexión: ${err.message}`);
             statuses.set(deviceId, ConnectionStatus.ERROR);
             emitEvent(deviceId, 'status', ConnectionStatus.ERROR);
@@ -291,6 +320,13 @@ async function connect(phoneNumber, deviceId = 'default', options = {}) {
       if (wasRegistered) {
         log('ok', '¡Credenciales guardadas — dispositivo registrado en WhatsApp!');
         log('ok', `  ID: ${sock.authState.creds.me?.id || 'desconocido'}`);
+        // Cancelar el timeout de expiración de pairing AQUÍ, en el evento más
+        // temprano y confiable de éxito — no depender de un connection.update
+        // posterior que puede llegar tarde y perder la carrera contra el timeout.
+        if (pairingTimeouts.has(deviceId)) {
+          clearTimeout(pairingTimeouts.get(deviceId));
+          pairingTimeouts.delete(deviceId);
+        }
       }
       await saveCreds();
     });
@@ -408,6 +444,14 @@ async function connect(phoneNumber, deviceId = 'default', options = {}) {
 
       const timeout = setTimeout(() => {
         if (statuses.get(deviceId) === ConnectionStatus.WAITING_PAIRING) {
+          // Defensa adicional: si por alguna razón las credenciales ya se
+          // registraron pero este timeout no llegó a cancelarse a tiempo,
+          // nunca lo tratamos como expiración ni tocamos el socket/auth state.
+          if (sock?.authState?.creds?.registered) {
+            log('info', 'Pairing ya fue aceptado — ignorando timeout de expiración');
+            pairingTimeouts.delete(deviceId);
+            return;
+          }
           log('warn', `Código de vinculación expirado para ${deviceId}`);
           console.log(`${chalk.dim('─'.repeat(50))}`);
           log('warn', `${chalk.bold('Código expirado:')} ${chalk.red(formattedCode)} — no se completó la vinculación a tiempo`);
