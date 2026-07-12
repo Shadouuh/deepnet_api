@@ -48,32 +48,19 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
-// Estados en los que ya hay un flujo de vinculación en curso para el
-// deviceId. Si el frontend reintenta /connect mientras uno de estos está
-// activo (doble click, retry, StrictMode, etc.), NO debe crearse un socket
-// nuevo: eso obligaría a cerrar el socket en curso justo cuando WhatsApp
-// puede estar terminando de validar el pairing, arruinando la vinculación.
-const PAIRING_IN_PROGRESS_STATUSES = new Set([
-  ConnectionStatus.CONNECTING,
-  ConnectionStatus.CODE_GENERATED,
-  ConnectionStatus.WAITING_PAIRING,
-]);
-
+// La protección contra sockets duplicados vive en WhatsAppConnection/index
+// del servicio (fuente única de verdad): si ya hay una conexión activa para
+// el deviceId, connect() la ignora en vez de crear una segunda. Acá no se
+// duplica esa lógica.
 app.post('/api/whatsapp/connect', asyncHandler(async (req, res) => {
-  const { phoneNumber, deviceId = 'default', force = false } = req.body;
+  const { phoneNumber, deviceId = 'default' } = req.body;
   if (!phoneNumber) {
     return res.status(400).json({ error: 'El número de teléfono es requerido' });
   }
 
-  const currentStatus = getStatus(deviceId);
-  if (!force && PAIRING_IN_PROGRESS_STATUSES.has(currentStatus)) {
-    return res.status(409).json({
-      error: 'Ya hay un proceso de vinculación en curso para este dispositivo. Esperá a que termine o expire antes de solicitar otro código.',
-      status: currentStatus,
-    });
-  }
-
-  connect(phoneNumber, deviceId);
+  connect(phoneNumber, deviceId).catch(err => {
+    console.error(chalk.red(`  💥 Error en connect() para ${deviceId}:`), err);
+  });
   res.json({ ok: true, message: 'Conectando...' });
 }));
 
@@ -93,15 +80,15 @@ app.get('/api/whatsapp/devices', (req, res) => {
   res.json(getDevices());
 });
 
-app.delete('/api/whatsapp/auth/:deviceId?', (req, res) => {
+app.delete('/api/whatsapp/auth/:deviceId?', asyncHandler(async (req, res) => {
   const deviceId = req.params.deviceId || 'default';
-  const result = clearAuthState(deviceId);
+  const result = await clearAuthState(deviceId);
   if (result.ok) {
     res.json({ ok: true, message: `Auth state cleared for ${deviceId}` });
   } else {
     res.status(500).json({ error: result.error });
   }
-});
+}));
 
 app.post('/api/whatsapp/send', asyncHandler(async (req, res) => {
   const { deviceId = 'default', jid, text } = req.body;
