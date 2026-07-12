@@ -77,6 +77,43 @@ function removeAllListeners(deviceId) {
   eventListeners.delete(deviceId);
 }
 
+/**
+ * Cierra y descarta el socket local de un deviceId SIN enviar logout a
+ * WhatsApp. Usar siempre para limpieza interna (p. ej. antes de recrear un
+ * socket en una reconexión). El logout real de la cuenta solo debe
+ * dispararse desde disconnect(), invocado explícitamente por el usuario.
+ */
+function closeSocketOnly(deviceId) {
+  const connection = connections.get(deviceId);
+  if (connection) {
+    try {
+      connection.sock?.end(undefined);
+    } catch (e) {
+      // ignore
+    }
+    connections.delete(deviceId);
+  }
+}
+
+/**
+ * Envuelve saveCreds en una cola secuencial: garantiza que cada escritura
+ * de creds.json se complete antes de iniciar la siguiente, evitando que
+ * eventos creds.update consecutivos (registro, account, signalIdentities,
+ * etc.) generen escrituras concurrentes fuera de orden que corrompan el
+ * auth state persistido. Cualquier error de escritura se loguea en vez de
+ * perderse como unhandled rejection.
+ */
+function createCredsSaveQueue(deviceId, saveCreds) {
+  let queue = Promise.resolve();
+  return () => {
+    queue = queue.then(() => saveCreds()).catch(err => {
+      log('error', `Fallo al guardar credenciales para ${deviceId}: ${err.message}`);
+      log('debug', `Stack: ${err.stack}`);
+    });
+    return queue;
+  };
+}
+
 async function connect(phoneNumber, deviceId = 'default', options = {}) {
   const validationError = validatePhoneNumber(phoneNumber);
   if (validationError) {
@@ -95,8 +132,13 @@ async function connect(phoneNumber, deviceId = 'default', options = {}) {
   log('info', `Iniciando conexión (${logMode}) — teléfono: ${chalk.bold(phoneNumber)}, dispositivo: ${chalk.bold(deviceId)}`);
 
   if (connections.has(deviceId)) {
-    log('warn', `Cerrando conexión existente para ${deviceId}...`);
-    await disconnect(deviceId);
+    // IMPORTANTE: acá NO se debe llamar a disconnect(), porque esa función
+    // ejecuta sock.logout() — un comando de protocolo que invalida la sesión
+    // real en WhatsApp. Este bloque solo limpia un socket local obsoleto
+    // antes de crear uno nuevo (p. ej. durante una reconexión interna
+    // post-pairing), y jamás debe enviar un logout real a WhatsApp.
+    log('warn', `Cerrando socket local obsoleto para ${deviceId} (sin logout)...`);
+    closeSocketOnly(deviceId);
   }
 
   if (pairingTimeouts.has(deviceId)) {
@@ -132,6 +174,8 @@ async function connect(phoneNumber, deviceId = 'default', options = {}) {
       keepAliveIntervalMs: 30000,
       generateHighQualityLinkPreview: false,
     });
+
+    const queuedSaveCreds = createCredsSaveQueue(deviceId, saveCreds);
 
     connections.set(deviceId, { sock, saveCreds, phoneNumber });
 
@@ -328,7 +372,8 @@ async function connect(phoneNumber, deviceId = 'default', options = {}) {
           pairingTimeouts.delete(deviceId);
         }
       }
-      await saveCreds();
+      // Encolado: nunca disparar escrituras concurrentes de creds.json.
+      await queuedSaveCreds();
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {

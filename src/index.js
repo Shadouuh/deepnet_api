@@ -48,11 +48,31 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
+// Estados en los que ya hay un flujo de vinculación en curso para el
+// deviceId. Si el frontend reintenta /connect mientras uno de estos está
+// activo (doble click, retry, StrictMode, etc.), NO debe crearse un socket
+// nuevo: eso obligaría a cerrar el socket en curso justo cuando WhatsApp
+// puede estar terminando de validar el pairing, arruinando la vinculación.
+const PAIRING_IN_PROGRESS_STATUSES = new Set([
+  ConnectionStatus.CONNECTING,
+  ConnectionStatus.CODE_GENERATED,
+  ConnectionStatus.WAITING_PAIRING,
+]);
+
 app.post('/api/whatsapp/connect', asyncHandler(async (req, res) => {
-  const { phoneNumber, deviceId = 'default' } = req.body;
+  const { phoneNumber, deviceId = 'default', force = false } = req.body;
   if (!phoneNumber) {
     return res.status(400).json({ error: 'El número de teléfono es requerido' });
   }
+
+  const currentStatus = getStatus(deviceId);
+  if (!force && PAIRING_IN_PROGRESS_STATUSES.has(currentStatus)) {
+    return res.status(409).json({
+      error: 'Ya hay un proceso de vinculación en curso para este dispositivo. Esperá a que termine o expire antes de solicitar otro código.',
+      status: currentStatus,
+    });
+  }
+
   connect(phoneNumber, deviceId);
   res.json({ ok: true, message: 'Conectando...' });
 }));
