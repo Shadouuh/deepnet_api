@@ -13,6 +13,22 @@ const ConnectionStatus = {
   ERROR: 'error',
 };
 
+// Nombres legibles para los códigos de DisconnectReason de Baileys, usados
+// solo para mostrar logs más claros — no cambian ninguna decisión de flujo.
+const DISCONNECT_REASON_NAMES = Object.entries(DisconnectReason).reduce((acc, [name, code]) => {
+  acc[code] = name;
+  return acc;
+}, {});
+
+function describeDisconnect(lastDisconnect) {
+  const statusCode = lastDisconnect?.error?.output?.statusCode;
+  const reasonName = DISCONNECT_REASON_NAMES[statusCode] || 'desconocido';
+  const rawMessage = lastDisconnect?.error?.output?.payload?.message
+    || lastDisconnect?.error?.message
+    || 'sin mensaje';
+  return { statusCode, reasonName, rawMessage };
+}
+
 /**
  * Representa el ciclo de vida completo de UN dispositivo de WhatsApp.
  *
@@ -119,7 +135,10 @@ class WhatsAppConnection {
         this.emit('pairingPhoneNumber', this.phoneNumber);
       }
     } catch (err) {
-      log('error', `[${this.deviceId}] Error iniciando conexión: ${err.message}`);
+      const statusCode = err?.output?.statusCode;
+      const reasonName = statusCode != null ? (DISCONNECT_REASON_NAMES[statusCode] || 'desconocido') : null;
+      const detail = reasonName ? ` [${reasonName} / ${statusCode}]` : '';
+      log('error', `[${this.deviceId}] Error iniciando conexión${detail}: ${err.message}`);
       this.setStatus(ConnectionStatus.ERROR);
       this.emit('error', err);
     } finally {
@@ -146,19 +165,20 @@ class WhatsAppConnection {
     }
 
     if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const { statusCode, reasonName, rawMessage } = describeDisconnect(lastDisconnect);
       const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
-      log('warn', `[${this.deviceId}] Conexión cerrada (código ${statusCode ?? 'desconocido'})`);
+      log('warn', `[${this.deviceId}] Conexión cerrada — motivo: ${reasonName} (código ${statusCode ?? 'desconocido'}) — "${rawMessage}"`);
       this.sock = null;
 
       if (isLoggedOut) {
-        log('error', `[${this.deviceId}] Sesión cerrada por WhatsApp — limpiando auth state`);
+        log('error', `[${this.deviceId}] WhatsApp cerró la sesión (401/loggedOut) — limpiando auth state y reiniciando desde cero. Si esto ocurre en el PRIMER intento (antes de ingresar el código en el teléfono), no es un logout real: normalmente indica que la conexión Noise falló (revisar el mensaje de error arriba) — causas típicas: la IP del servidor está bloqueada/limitada por WhatsApp (común en datacenters como Render/AWS/GCP), o hay un auth state corrupto de un intento anterior.`);
         this.clearAuthState();
         this.setStatus(ConnectionStatus.DISCONNECTED);
         return;
       }
 
+      log('info', `[${this.deviceId}] Motivo no es loggedOut — reconectando con el mismo auth state (comportamiento esperado si aún no se ingresó el código, o si es el reinicio obligatorio tras validarlo)`);
       this.start().catch(err => {
         log('error', `[${this.deviceId}] Error reconectando: ${err.message}`);
         this.setStatus(ConnectionStatus.ERROR);
