@@ -14,6 +14,26 @@ const ACTIVE_STATUSES = new Set([
   ConnectionStatus.CONNECTED,
 ]);
 
+function reportDebug(hypothesisId, location, msg, data = {}) {
+  // #region debug-point A:service-reporting
+  const envPath = require('path').resolve(__dirname, '..', '..', '.dbg', 'baileys-connect-close.env');
+  let url = 'http://127.0.0.1:7777/event';
+  let sessionId = 'baileys-connect-close';
+  try {
+    const env = fs.readFileSync(envPath, 'utf8');
+    url = env.match(/DEBUG_SERVER_URL=(.+)/)?.[1] || url;
+    sessionId = env.match(/DEBUG_SESSION_ID=(.+)/)?.[1] || sessionId;
+  } catch (_) {}
+  if (typeof fetch === 'function') {
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, runId: 'post-fix', hypothesisId, location, msg, data, ts: Date.now() }),
+    }).catch(() => {});
+  }
+  // #endregion
+}
+
 function emitEvent(deviceId, event, data) {
   const listeners = eventListeners.get(deviceId);
   if (!listeners) return;
@@ -69,25 +89,84 @@ async function connect(phoneNumber, deviceId = 'default') {
   const cleaned = phoneNumber.replace(/[^0-9]/g, '');
 
   const existing = instances.get(deviceId);
+  // #region debug-point C:connect-entry
+  reportDebug('C', 'src/whatsapp/index.js:connect', '[DEBUG] service connect() called', {
+    deviceId,
+    cleanedPhoneNumber: cleaned,
+    existingStatus: existing?.status || null,
+    hasExistingInstance: Boolean(existing),
+  });
+  // #endregion
   if (existing && ACTIVE_STATUSES.has(existing.status)) {
     log('warn', `[${deviceId}] Ya hay una conexión activa (${existing.status}) — se ignora el nuevo pedido`);
+    // #region debug-point C:connect-reused
+    reportDebug('C', 'src/whatsapp/index.js:connect', '[DEBUG] service connect() ignored because existing instance is active', {
+      deviceId,
+      existingStatus: existing.status,
+    });
+    // #endregion
+    return;
+  }
+
+  if (existing) {
+    existing.setPhoneNumber(cleaned);
+
+    if (!existing.canStartNewAttempt()) {
+      const retryAfterMs = existing.getRetryAfterMs();
+      const seconds = Math.max(1, Math.ceil(retryAfterMs / 1000));
+      const message = `[${deviceId}] WhatsApp viene cerrando los intentos de pairing muy rápido. Espero ${seconds}s antes del próximo intento para no seguir forzando requests contra el handshake.`;
+      log('warn', message);
+      emitEvent(deviceId, 'error', Object.assign(new Error(message), {
+        retryAfterMs,
+        code: 'PAIRING_COOLDOWN',
+      }));
+      return;
+    }
+
+    // #region debug-point C:connect-restart
+    reportDebug('C', 'src/whatsapp/index.js:connect', '[DEBUG] reusing existing WhatsAppConnection instance for a fresh socket attempt', {
+      deviceId,
+      previousStatus: existing.status,
+    });
+    // #endregion
+    await existing.start();
     return;
   }
 
   const connection = new WhatsAppConnection(deviceId, cleaned, (event, data) => emitEvent(deviceId, event, data));
   instances.set(deviceId, connection);
+  // #region debug-point C:connect-created
+  reportDebug('C', 'src/whatsapp/index.js:connect', '[DEBUG] new WhatsAppConnection instance created', {
+    deviceId,
+    instanceCount: instances.size,
+  });
+  // #endregion
   await connection.start();
 }
 
 /** Desvinculación explícita solicitada por el usuario. */
 async function disconnect(deviceId = 'default') {
   const connection = instances.get(deviceId);
+  // #region debug-point B:disconnect-entry
+  reportDebug('B', 'src/whatsapp/index.js:disconnect', '[DEBUG] service disconnect() called', {
+    deviceId,
+    hasConnection: Boolean(connection),
+    status: connection?.status || null,
+    instanceCount: instances.size,
+  });
+  // #endregion
   if (!connection) {
     log('warn', `[${deviceId}] No hay conexión activa para desconectar`);
     return;
   }
   await connection.disconnect();
   instances.delete(deviceId);
+  // #region debug-point B:disconnect-finished
+  reportDebug('B', 'src/whatsapp/index.js:disconnect', '[DEBUG] service disconnect() finished and instance removed', {
+    deviceId,
+    instanceCount: instances.size,
+  });
+  // #endregion
 }
 
 function getStatus(deviceId = 'default') {

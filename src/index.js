@@ -6,6 +6,7 @@ const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const chalk = require('chalk');
+const fs = require('fs');
 const {
   connect,
   disconnect,
@@ -16,6 +17,26 @@ const {
   on,
   ConnectionStatus,
 } = require('./whatsapp.service');
+
+function reportDebug(hypothesisId, location, msg, data = {}) {
+  // #region debug-point A:http-reporting
+  const envPath = require('path').resolve(__dirname, '..', '.dbg', 'baileys-connect-close.env');
+  let url = 'http://127.0.0.1:7777/event';
+  let sessionId = 'baileys-connect-close';
+  try {
+    const env = fs.readFileSync(envPath, 'utf8');
+    url = env.match(/DEBUG_SERVER_URL=(.+)/)?.[1] || url;
+    sessionId = env.match(/DEBUG_SESSION_ID=(.+)/)?.[1] || sessionId;
+  } catch (_) {}
+  if (typeof fetch === 'function') {
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, runId: 'post-fix', hypothesisId, location, msg, data, ts: Date.now() }),
+    }).catch(() => {});
+  }
+  // #endregion
+}
 
 const PORT = process.env.BACKEND_PORT || process.env.PORT || 3001;
 const CORS_ORIGIN = process.env.BACKEND_CORS_ORIGIN || process.env.CORS_ORIGIN || '*';
@@ -58,6 +79,17 @@ app.post('/api/whatsapp/connect', asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'El número de teléfono es requerido' });
   }
 
+  // #region debug-point A:http-connect
+  reportDebug('A', 'src/index.js:/api/whatsapp/connect', '[DEBUG] HTTP connect request', {
+    deviceId,
+    phoneNumber,
+    ip: req.ip,
+    userAgent: req.get('user-agent'),
+    origin: req.get('origin'),
+    referer: req.get('referer'),
+  });
+  // #endregion
+
   connect(phoneNumber, deviceId).catch(err => {
     console.error(chalk.red(`  💥 Error en connect() para ${deviceId}:`), err);
   });
@@ -66,6 +98,16 @@ app.post('/api/whatsapp/connect', asyncHandler(async (req, res) => {
 
 app.post('/api/whatsapp/disconnect', asyncHandler(async (req, res) => {
   const { deviceId = 'default' } = req.body;
+  // #region debug-point B:http-disconnect
+  reportDebug('B', 'src/index.js:/api/whatsapp/disconnect', '[DEBUG] HTTP disconnect request', {
+    deviceId,
+    ip: req.ip,
+    userAgent: req.get('user-agent'),
+    origin: req.get('origin'),
+    referer: req.get('referer'),
+    body: req.body,
+  });
+  // #endregion
   await disconnect(deviceId);
   res.json({ ok: true });
 }));
